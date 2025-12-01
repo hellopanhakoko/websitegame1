@@ -1,0 +1,5 @@
+Flask
+requests
+qrcode
+bakong-khqr
+pytz
