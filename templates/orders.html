@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>My Orders</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+    body { font-family:'Poppins', sans-serif; background: linear-gradient(135deg,#1f1c2c,#928dab); color:#fff; margin:0; padding:20px; }
+    h1 { text-align:center; margin-bottom:20px; }
+    table { width:100%; border-collapse:collapse; background: rgba(255,255,255,0.05); border-radius:12px; overflow:hidden; }
+    th, td { padding:12px; text-align:center; border-bottom:1px solid rgba(255,255,255,0.1); }
+    th { background: rgba(255,255,255,0.1); }
+    tr:last-child td { border-bottom:none; }
+    .status-paid { color: lightgreen; font-weight:600; }
+    .status-unpaid { color: #ffcc00; font-weight:600; }
+    .status-expired { color: #ff8a8a; font-weight:600; }
+</style>
+</head>
+<body>
+
+<h1>My Orders</h1>
+
+<table>
+    <thead>
+        <tr>
+            <th>Order ID</th>
+            <th>Game</th>
+            <th>Item</th>
+            <th>Amount</th>
+            <th>Status</th>
+            <th>Created At</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for order in orders %}
+        <tr>
+            <td>{{ order[0] }}</td>
+            <td>{{ order[2] }}</td>
+            <td>{{ order[1].replace('_',' ') }}</td>
+            <td>${{ order[3] }}</td>
+            <td class="status-{{ order[4]|lower }}">{{ order[4] }}</td>
+            <td>{{ order[5] }}</td>
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="6">No orders found.</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+</body>
+</html>

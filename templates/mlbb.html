@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Game Shop</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap" rel="stylesheet" />
+<style>
+body {
+    font-family: 'Poppins', sans-serif;
+    background: linear-gradient(135deg,#1f1c2c,#928dab);
+    margin:0;
+    color:#fff;
+}
+.wrap {
+    max-width:1100px;
+    margin:28px auto;
+    padding:28px;
+}
+header {
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    margin-bottom:20px;
+}
+h1 { margin:0; font-size:28px; }
+.small { font-size:14px; opacity:0.9; }
+
+/* Panel */
+.panel {
+    background: rgba(255,255,255,0.06);
+    padding:20px;
+    border-radius:12px;
+}
+.form-row {
+    display:flex;
+    gap:12px;
+    margin-bottom:12px;
+    flex-wrap:wrap;
+}
+input {
+    padding:12px 16px;
+    border-radius:8px;
+    border:none;
+    flex:1;
+}
+
+/* Item Buttons */
+.container {
+    display:grid;
+    grid-template-columns: repeat(auto-fit,minmax(180px,1fr));
+    gap:18px;
+    margin-top:18px;
+}
+.item-btn {
+    background: rgba(255,255,255,0.08);
+    padding:18px;
+    border-radius:14px;
+    text-align:center;
+    cursor:pointer;
+    transition: transform .2s, background .2s, box-shadow .2s;
+    border:2px solid transparent;
+}
+.item-btn:hover {
+    transform: translateY(-6px);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+}
+.item-btn.selected {
+    border:2px solid #ffd369;
+    background: rgba(255,255,255,0.2);
+}
+
+.item-title {
+    color:#ffd369;
+    font-weight:600;
+    margin-bottom:8px;
+}
+.price {
+    color:#70ff8d;
+    font-weight:700;
+    font-size:18px;
+    margin-bottom:8px;
+}
+
+.buy-btn {
+    background:#7f5cff;
+    border:none;
+    padding:14px 22px;
+    color:#fff;
+    border-radius:8px;
+    cursor:pointer;
+    font-weight:600;
+    transition: 0.2s;
+}
+.buy-btn:hover {
+    background:#9a6eff;
+}
+
+hr { opacity:0.1; margin:30px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+    <h1>Game Shop</h1>
+    <div class="small">User: {{ session.username if session.username else 'guest' }}</div>
+</header>
+
+<!-- BUY FORM -->
+<div class="panel">
+<form id="buy-form" method="POST" action="{{ url_for('buy') }}">
+    <input type="hidden" name="item_id" id="selected-item" required>
+    <input type="hidden" name="game" id="selected-game" required>
+
+    <div class="form-row">
+        <input type="text" name="server_id" placeholder="Server ID" required>
+        <input type="text" name="zone_id" placeholder="Zone ID" required>
+        <button class="buy-btn" type="submit">Buy</button>
+    </div>
+    <div class="small">Select an item below, enter Server ID + Zone ID, then press Buy.</div>
+</form>
+</div>
+
+<!-- MLBB ITEMS -->
+<h2>Mobile Legends (MLBB)</h2>
+<div class="container">
+    {% for id, price in ml_items.items() %}
+    <div class="item-btn" data-game="MLBB" data-item="{{ id }}">
+        <div class="item-title">{{ id.replace('_',' ') }}</div>
+        <div class="price">${{ price.normal }}</div>
+    </div>
+    {% endfor %}
+</div>
+
+<hr>
+
+<!-- FF ITEMS -->
+<h2>Free Fire (FF)</h2>
+<div class="container">
+    {% for id, price in ff_items.items() %}
+    <div class="item-btn" data-game="FF" data-item="{{ id }}">
+        <div class="item-title">{{ id.replace('_',' ') }}</div>
+        <div class="price">${{ price.normal }}</div>
+    </div>
+    {% endfor %}
+</div>
+
+</div>
+
+<script>
+const buttons = document.querySelectorAll('.item-btn');
+const selItem = document.getElementById('selected-item');
+const selGame = document.getElementById('selected-game');
+
+buttons.forEach(btn => {
+    btn.addEventListener('click', () => {
+        buttons.forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected');
+        selItem.value = btn.dataset.item;
+        selGame.value = btn.dataset.game;
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+});
+</script>
+
+</body>
+</html>
