@@ -1,5 +1,9 @@
-Flask
+fastapi
+uvicorn
+jinja2
+aiofiles
 requests
 qrcode
 bakong-khqr
 pytz
+sqlite3
