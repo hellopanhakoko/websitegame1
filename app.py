@@ -1,38 +1,41 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
-import sqlite3
 import os
 import random
 import string
-from bakong_khqr import KHQR
-import qrcode
+import base64
+import asyncio
 from io import BytesIO
 from datetime import datetime
+import sqlite3
 import pytz
-import threading
-import time
-import base64
-import requests
 import logging
+
+import qrcode
+import requests
+from fastapi import FastAPI, Request, Form, Depends
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from bakong_khqr import KHQR
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ---------- App & Config ----------
-app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "YOUR_SECRET_KEY")
+# ---------- App ----------
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")
 
 API_TOKEN = os.getenv("API_TOKEN", "your_api_token_here")
 khqr = KHQR(API_TOKEN)
 BANK_ACCOUNT = os.getenv("BANK_ACCOUNT", "chhira_ly@aclb")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "855882000544")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Phnom_Penh")
+DB = "bot_data.db"
 
-# Track user active orders to prevent duplicates: user_id -> order_id
-users_in_payment: dict[int, str] = {}
+# Track active payments: user_id -> order_id
+users_in_payment = {}
+order_user_map = {}
 
-# In-memory store for orders
-ORDERS = {}
-REJECTS = {}  # Store completed transactions
+# Store completed transactions (in-memory for now)
+REJECTS = {}
 
 # ---------- Helpers ----------
 def now_iso():
@@ -42,14 +45,10 @@ def now_iso():
 def generate_short_transaction_id() -> str:
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
-# ---------- Database ----------
-DB = "bot_data.db"
-
-def init_db() -> None:
+def init_db():
     with sqlite3.connect(DB) as conn:
-        cursor = conn.cursor()
-        # users table
-        cursor.execute("""
+        c = conn.cursor()
+        c.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
@@ -57,8 +56,7 @@ def init_db() -> None:
                 is_reseller INTEGER DEFAULT 0
             )
         """)
-        # item_prices table
-        cursor.execute("""
+        c.execute("""
             CREATE TABLE IF NOT EXISTS item_prices (
                 item_id TEXT PRIMARY KEY,
                 game TEXT,
@@ -66,8 +64,7 @@ def init_db() -> None:
                 reseller_price REAL
             )
         """)
-        # orders table: save orders + qr md5 + payment response (receipt)
-        cursor.execute("""
+        c.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 order_id TEXT PRIMARY KEY,
                 user_id INTEGER,
@@ -83,9 +80,7 @@ def init_db() -> None:
                 paid_at TEXT
             )
         """)
-        conn.commit()
-
-        # Insert default items if not exists
+        # Insert default items
         items = [
             ("86_DIAMOND", "MLBB", 0.03, 0.03),
             ("172_DIAMAND", "MLBB", 0.03, 0.03),
@@ -100,48 +95,28 @@ def init_db() -> None:
             ("1060_DIAMOND", "FF", 18.40, 17.00),
             ("2180_DIAMOND", "FF", 36.80, 34.00),
         ]
-        cursor.executemany("""
+        c.executemany("""
             INSERT OR IGNORE INTO item_prices (item_id, game, normal_price, reseller_price)
             VALUES (?, ?, ?, ?)
         """, items)
         conn.commit()
-
     logging.info("Database initialized.")
 
-
-# ---------- Item / User functions ----------
-def get_item_prices(game: str) -> dict:
+def get_item_prices(game: str):
     with sqlite3.connect(DB) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT item_id, normal_price, reseller_price FROM item_prices WHERE game=?", (game,))
-        rows = cursor.fetchall()
+        c = conn.cursor()
+        c.execute("SELECT item_id, normal_price, reseller_price FROM item_prices WHERE game=?", (game,))
+        rows = c.fetchall()
     return {r[0]: {"normal": r[1], "reseller": r[2]} for r in rows}
 
-def get_balance(user_id: int) -> float:
+def is_reseller(user_id: int):
     with sqlite3.connect(DB) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        r = cursor.fetchone()
-    return r[0] if r else 0.0
+        c = conn.cursor()
+        c.execute("SELECT is_reseller FROM users WHERE user_id=?", (user_id,))
+        r = c.fetchone()
+    return r[0] == 1 if r else False
 
-def update_balance(user_id: int, amount: float) -> None:
-    with sqlite3.connect(DB) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        r = cursor.fetchone()
-        if r:
-            new_balance = r[0] + amount
-            cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, user_id))
-        else:
-            cursor.execute("INSERT INTO users(user_id, balance) VALUES(?, ?)", (user_id, amount))
-        conn.commit()
-    logging.info(f"Balance updated for user {user_id}: +{amount}")
-
-# ---------- QR Generation ----------
 def generate_qr_code(amount: float):
-    """
-    Returns tuple (qr_b64, md5) or (None, None) on error.
-    """
     try:
         qr_payload = khqr.create_qr(
             bank_account=BANK_ACCOUNT,
@@ -163,146 +138,77 @@ def generate_qr_code(amount: float):
         b64 = base64.b64encode(buf.getvalue()).decode()
         return b64, md5_hash
     except Exception as e:
-        logging.error("generate_qr_code error: %s", e)
+        logging.error("QR generation failed: %s", e)
         return None, None
 
-# ---------- Payment background checker ----------
-def check_payment_background(order_id: str, md5: str, amount: float):
-    """
-    Polls the external endpoint. When PAID, update the order record.
-    """
-    def run_checker():
-        start = time.time()
-        logging.info("Started payment checker for order %s", order_id)
-        while time.time() - start < 300:  # 5 minutes timeout
-            try:
-                url = f"https://panha-dev.vercel.app/check_payment/{md5}"
-                resp = requests.get(url, timeout=10)
-                resp.raise_for_status()
-                data = resp.json()
-                logging.debug("Payment API response for %s: %s", order_id, data)
-
-                # Save the last known payment response to DB each iteration (optional)
-                with sqlite3.connect(DB) as conn:
-                    c = conn.cursor()
-                    c.execute("UPDATE orders SET payment_response=? WHERE order_id=?", (str(data), order_id))
-                    conn.commit()
-
-                if data.get("success") and data.get("status") == "PAID":
-                    paid_at = now_iso()
-                    with sqlite3.connect(DB) as conn:
-                        c = conn.cursor()
-                        c.execute("UPDATE orders SET status=?, paid_at=?, payment_response=? WHERE order_id=?",
-                                  ("PAID", paid_at, str(data), order_id))
-                        conn.commit()
-
-                    # optionally update user balance or perform delivery actions here
-                    # example: update_balance(user_id, amount)  # only if you top-up balance
-                    users_in_payment.pop(order_user_map.get(order_id), None)
-                    logging.info("Order %s marked as PAID", order_id)
-                    break
-
-            except requests.RequestException as e:
-                logging.warning("Payment check request error for %s: %s", order_id, e)
-            except Exception as e:
-                logging.error("Unexpected error in payment checker for %s: %s", order_id, e)
-
-            time.sleep(8)
-
-        else:
-            # timeout: mark UNPAID_EXPIRED
+async def check_payment_background(order_id: str, md5: str, user_id: int):
+    logging.info(f"Started async payment checker for order {order_id}")
+    start = datetime.now().timestamp()
+    while datetime.now().timestamp() - start < 300:  # 5 min
+        try:
+            url = f"https://panha-dev.vercel.app/check_payment/{md5}"
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            # Update order response
             with sqlite3.connect(DB) as conn:
                 c = conn.cursor()
-                c.execute("SELECT status FROM orders WHERE order_id=?", (order_id,))
-                r = c.fetchone()
-                if r and r[0] == "UNPAID":
-                    c.execute("UPDATE orders SET status=? WHERE order_id=?", ("EXPIRED", order_id))
+                c.execute("UPDATE orders SET payment_response=? WHERE order_id=?", (str(data), order_id))
+                conn.commit()
+            # If paid
+            if data.get("success") and data.get("status") == "PAID":
+                paid_at = now_iso()
+                with sqlite3.connect(DB) as conn:
+                    c = conn.cursor()
+                    c.execute("UPDATE orders SET status=?, paid_at=?, payment_response=? WHERE order_id=?",
+                              ("PAID", paid_at, str(data), order_id))
                     conn.commit()
-            users_in_payment.pop(order_user_map.get(order_id), None)
-            logging.info("Order %s expired (no payment)", order_id)
-
-    # map to find user->order_id in reverse for cleanup
-    # ensure global map exists
-    global order_user_map
-    try:
-        order_user_map
-    except NameError:
-        order_user_map = {}
-
-    # try to find the user_id for this order and set the maps
+                users_in_payment.pop(user_id, None)
+                logging.info(f"Order {order_id} marked as PAID")
+                return
+        except Exception as e:
+            logging.warning(f"Payment check failed for {order_id}: {e}")
+        await asyncio.sleep(8)
+    # Expired
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        c.execute("SELECT user_id FROM orders WHERE order_id=?", (order_id,))
-        row = c.fetchone()
-        if row:
-            user_id = row[0]
-            order_user_map[order_id] = user_id
-            users_in_payment[user_id] = order_id
-
-    t = threading.Thread(target=run_checker, daemon=True)
-    t.start()
+        c.execute("UPDATE orders SET status=? WHERE order_id=?", ("EXPIRED", order_id))
+        conn.commit()
+    users_in_payment.pop(user_id, None)
+    logging.info(f"Order {order_id} expired.")
 
 # ---------- Routes ----------
-@app.route("/")
-def home():
-    if 'user_id' not in session:
-        # for demo convenience, auto-login as user 1
-        session['user_id'] = 1
-        session['username'] = "demo_user"
-        # ensure user exists
-        with sqlite3.connect(DB) as conn:
-            c = conn.cursor()
-            c.execute("INSERT OR IGNORE INTO users(user_id, username) VALUES(?, ?)", (1, "demo_user"))
-            conn.commit()
-
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    # For demo, auto-login user 1
+    user_id = 1
+    username = "demo_user"
+    # Ensure user exists
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users(user_id, username) VALUES(?, ?)", (user_id, username))
+        conn.commit()
     ml_items = get_item_prices("MLBB")
     ff_items = get_item_prices("FF")
-    return render_template("mlbb.html", ml_items=ml_items, ff_items=ff_items, reseller=is_reseller(session['user_id']))
+    return templates.TemplateResponse("mlbb.html", {"request": request, "ml_items": ml_items, "ff_items": ff_items, "reseller": is_reseller(user_id)})
 
-
-@app.route('/reject')
-def reject():
-    # List all completed transactions
-    return render_template("reject.html", rejects=REJECTS)
-
-@app.route("/buy", methods=["POST"])
-def buy():
-    """
-    Handles buy form:
-    form fields: game, item_id, server_id, zone_id
-    """
-    if 'user_id' not in session:
-        flash("Please login first.")
-        return redirect(url_for("home"))
-
-    user_id = session['user_id']
-    game = request.form.get("game")
-    item_id = request.form.get("item_id")
-    server_id = request.form.get("server_id", "").strip()
-    zone_id = request.form.get("zone_id", "").strip()
-
-    # validate
-    if not (game and item_id and server_id and zone_id):
-        flash("Please fill Server ID, Zone ID and choose an item.")
-        return redirect(url_for("home"))
-
-    # get price
+@app.post("/buy", response_class=HTMLResponse)
+async def buy(request: Request,
+              game: str = Form(...),
+              item_id: str = Form(...),
+              server_id: str = Form(...),
+              zone_id: str = Form(...)):
+    user_id = 1  # demo user
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
         c.execute("SELECT normal_price FROM item_prices WHERE item_id=? AND game=?", (item_id, game))
         row = c.fetchone()
         if not row:
-            flash("Item not found.")
-            return redirect(url_for("home"))
+            return HTMLResponse("Item not found", status_code=400)
         amount = float(row[0])
-
-    # generate order
     order_id = generate_short_transaction_id()
     qr_b64, md5 = generate_qr_code(amount)
-    if not qr_b64 or not md5:
-        flash("Failed to generate QR. Try again later.")
-        return redirect(url_for("home"))
-
+    if not qr_b64:
+        return HTMLResponse("Failed to generate QR", status_code=500)
     created_at = now_iso()
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -311,47 +217,20 @@ def buy():
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (order_id, user_id, game, item_id, amount, server_id, zone_id, md5, "UNPAID", created_at))
         conn.commit()
-
+    users_in_payment[user_id] = order_id
     # start background checker
-    check_payment_background(order_id, md5, amount)
+    asyncio.create_task(check_payment_background(order_id, md5, user_id))
+    return templates.TemplateResponse("deposit.html", {"request": request, "qr": qr_b64, "order_id": order_id, "amount": amount})
 
-    # show deposit page with QR
-    return render_template("deposit.html", qr=qr_b64, order_id=order_id, amount=amount)
-
-@app.route("/order_status/<order_id>")
-def order_status(order_id):
+@app.get("/order_status/{order_id}")
+async def order_status(order_id: str):
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
         c.execute("SELECT status, payment_response, paid_at FROM orders WHERE order_id=?", (order_id,))
         r = c.fetchone()
     if not r:
-        return jsonify({"error": "not found"}), 404
-    return jsonify({"status": r[0], "payment_response": r[1], "paid_at": r[2]})
-
-@app.route("/orders")
-def orders():
-    if 'user_id' not in session:
-        return redirect(url_for("home"))
-    uid = session['user_id']
-    with sqlite3.connect(DB) as conn:
-        c = conn.cursor()
-        c.execute("SELECT order_id, game, item_id, amount, server_id, zone_id, status, created_at, paid_at FROM orders WHERE user_id=? ORDER BY created_at DESC", (uid,))
-        rows = c.fetchall()
-    return render_template("orders.html", orders=rows)
-
-@app.route('/check_payment_status/<int:user_id>')
-def check_payment_status(user_id: int):
-    paid = user_id not in users_in_payment
-    return jsonify({"paid": paid})
-
-def is_reseller(user_id: int) -> bool:
-    with sqlite3.connect(DB) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT is_reseller FROM users WHERE user_id=?", (user_id,))
-        result = cursor.fetchone()
-    return result[0] == 1 if result else False
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {"status": r[0], "payment_response": r[1], "paid_at": r[2]}
 
 # ---------- Start ----------
-if __name__ == "__main__":
-    init_db()
-    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+init_db()
