@@ -120,7 +120,7 @@ def generate_qr_code(amount: float):
     try:
         qr_payload = khqr.create_qr(
             bank_account=BANK_ACCOUNT,
-            merchant_name='PI YA LEGEND',
+            merchant_name='HELLO BAKONG',
             merchant_city='Phnom Penh',
             amount=amount,
             currency='USD',
@@ -234,3 +234,4 @@ async def order_status(order_id: str):
 
 # ---------- Start ----------
 init_db()
+
